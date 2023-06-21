@@ -40,7 +40,7 @@ from .ds import *
 #    - Energy cap: 89.2 Wh (321120 J)
 
 # Parameters for drone ========================================================
-DRONE_MAX_GND_SPEED = 25 # [m/s] # From literature *
+DRONE_MAX_GND_SPEED = 25 # [m/s] # From literature [1]
 DRONE_LAUNCHING_SPEED = 10 # [m/s]
 DRONE_LANDING_SPEED = 5 # [m/s]
 DRONE_EMPTY_WEIGHT = 1.5 # [kg]
@@ -49,7 +49,7 @@ DRONE_CRUISE_ALTITUDE = 50 # [m]
 DRONE_BATTARY_CAPACITY = 400000 # [J]  # This number is reasonable as we can find 11000 mAh batteries
 
 # Reference ===================================================================
-# * Drone Deliveries Logistics, Efficiency, Safety and Last Mile Trade-offs
+# [1] Drone Deliveries Logistics, Efficiency, Safety and Last Mile Trade-offs
 # Link: http://web.cecs.pdx.edu/~maf/Conference_Proceedings/2018_Drone_Deliveries_Logistics_Efficiency_Safety_Last_Mile_Trade-offs.pdf
 
 # NOTE ========================================================================
@@ -311,7 +311,6 @@ def optDroneDropSpeed(
     # Step 2: Reduce energy consumption, this step is done by reducing ground speeds
     # NOTE: Purpose of this step is to find a feasible solution
     while (True):
-        print(ergy, gndSpdList)
         bestReducedLegIndex = len(gndSpdList)
         for i in range(len(gndSpdList)):
             if (gndSpdList[i] > spdPrecise):
@@ -338,24 +337,12 @@ def optDroneDropSpeed(
             'payloadSeq': [],
             'profileTime': 0
         }
-    # else:
-    #     profile = calProfile(gndSpdList, gndDistList)
-    #     return {
-    #         'feasible': True,
-    #         'gndSpdList': gndSpdList,
-    #         'remainBat': cruiseBat - ergy,
-    #         'timeStamps': profile['timeStamps'],
-    #         'visitSeq': profile['visitSeq'],
-    #         'payloadSeq': profile['payloadSeq'],
-    #         'profileTime': profile['profileTime']
-    #     }
 
     # Step 3: When we find a solution which the energy consumption is within cruiseBat, improve gndSpds
     # NOTE: Improving direction is the best \Delta Energy / \Delta Time
 
     profileTime = calProfile(gndSpdList, gndDistList)['profileTime']
     while (True):
-        print(ergy, gndSpdList)
         marginImprove = []
         for i in range(len(gndSpdList)):
             if(gndSpdList[i] + spdPrecise <= maxGndSpd):
