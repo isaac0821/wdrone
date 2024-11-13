@@ -1,17 +1,10 @@
 import math
+from itertools import product
 
 import sys
 sys.path.append("D:/Zoo/Gibbon/vrpSolver")
 import vrpSolver
-
-from .common import *
-from .error import *
-from .ds import *
-
-# History =====================================================================
-# 20230613 - Independent from PDSTSPWI, gull, vrpSolver
-#          - Now support multiple legs in the flight
-# =============================================================================
+from vrpSolver.common import *
 
 # Description =================================================================
 # This script calculates the optimal speed for a drone to make delivery under changing wind condition
@@ -39,457 +32,767 @@ from .ds import *
 #    - Battery voltage: 15.2 V
 #    - Energy cap: 89.2 Wh (321120 J)
 
+# The time of each step of drone delivery =====================================
+#    - With payload - Launching from depot
+#    - With payload - Cruise to customer
+#    - With payload - Hover at customer (could be zero) 
+#    - With payload - Landing at customer (could be zero)
+#    - Without payload - Launching from customer (could be zero)
+#    - Without payload - Cruise to depot
+#    - Without payload - Landing at depot
+
 # Parameters for drone ========================================================
-DRONE_MAX_GND_SPEED = 25 # [m/s] # From literature [1]
-DRONE_LAUNCHING_SPEED = 10 # [m/s]
+DRONE_SPEED_LIMIT = 10 # [m/s]
+DRONE_MIN_GND_SPEED = 10 # [m/s]
+DRONE_MAX_GND_SPEED = 25 # [m/s] # From literature *
+DRONE_TAKEOFF_SPEED = 10 # [m/s]
 DRONE_LANDING_SPEED = 5 # [m/s]
 DRONE_EMPTY_WEIGHT = 1.5 # [kg]
 DRONE_PARCEL_WEIGHT = 2 # [kg]
 DRONE_CRUISE_ALTITUDE = 50 # [m]
 DRONE_BATTARY_CAPACITY = 400000 # [J]  # This number is reasonable as we can find 11000 mAh batteries
+DRONE_LANDING_FLAG = True # True if we need to land at the customer location
 
-# Reference ===================================================================
-# [1] Drone Deliveries Logistics, Efficiency, Safety and Last Mile Trade-offs
+# Reference
+# * Drone Deliveries Logistics, Efficiency, Safety and Last Mile Trade-offs
 # Link: http://web.cecs.pdx.edu/~maf/Conference_Proceedings/2018_Drone_Deliveries_Logistics_Efficiency_Safety_Last_Mile_Trade-offs.pdf
 
 # NOTE ========================================================================
 # In this script, windDeg is the direction of the wind speed vector (start from the drone)
 # In meteorology term, wind direction is the direction where the wind comes from
 
-def droneLaunchEnergy(windSpd:float, windDeg: float, payload: float, launchSpd: float=DRONE_LAUNCHING_SPEED, cruiseAlt: float=DRONE_CRUISE_ALTITUDE)-> float:
-    """Energy consumption of launching the drone"""
-    return (cruiseAlt / launchSpd) * droneConsumptionRate(
-        payload = payload, vertSpd = launchSpd, windSpd = windSpd, windDeg = windDeg, gndSpd = 0, gndDeg = 0)
+def profileOptTurnaround(
+    startLoc: pt,
+    cusLoc: pt,
+    endLoc: pt,
+    hoverTime: float = 0,
+    serviceTime: float = 0,
+    landFlag: bool = DRONE_LANDING_FLAG,
+    payload: float = DRONE_PARCEL_WEIGHT,
+    batCap: float = DRONE_BATTARY_CAPACITY, 
+    windSpd: float = 0,
+    windDeg: float = 0) -> dict:
 
-def droneDropParcelEnergy(windSpd:float, windDeg: float, payload: float, hovering: float, launchSpd: float=DRONE_LAUNCHING_SPEED, landingSpd: float=DRONE_LANDING_SPEED, cruiseAlt: float=DRONE_CRUISE_ALTITUDE) -> float:
-    """Energy consumption for hovering, landing and launch again"""
-    erg = 0
-    # Hovering energy
-    erg += hovering * droneConsumptionRate(
-        payload = payload, vertSpd = 0, windSpd = windSpd, windDeg = windDeg, gndSpd = 0, gndDeg = 0)
-    # Landing energy
-    erg += (cruiseAlt / landingSpd) * droneConsumptionRate(
-        payload = payload, vertSpd = landingSpd, windSpd = windSpd, windDeg = windDeg, gndSpd = 0, gndDeg = 0)
-    # Relaunching energy
-    erg += (cruiseAlt / launchSpd) * droneConsumptionRate(
-        payload = 0, vertSpd = launchSpd, windSpd = windSpd, windDeg = windDeg, gndSpd = 0, gndDeg = 0)
-    return erg
+    # Ground speed degree =====================================================
+    gndDegToCustomer = vrpSolver.headingLatLon(startLoc, cusLoc)
+    gndDegToEndLoc = vrpSolver.headingLatLon(cusLoc, endLoc)
+    gndDistToCustomer = vrpSolver.distLatLon(startLoc, cusLoc, distUnit='meter')
+    gndDistToEndLoc = vrpSolver.distLatLon(cusLoc, endLoc, distUnit='meter')
 
-def droneLandingEnergy(windSpd:float, windDeg: float, payload: float, landingSpd: float=DRONE_LANDING_SPEED, cruiseAlt: float=DRONE_CRUISE_ALTITUDE) -> float:
-    """Energy consumption of landing the drone"""
-    return (cruiseAlt / landingSpd) * droneConsumptionRate(
-        payload = payload, vertSpd = landingSpd, windSpd = windSpd, windDeg = windDeg, gndSpd = 0, gndDeg = 0)
+    # Initialize ==============================================================
+    curGndSpdToCus = None
+    curGndSpdFromCus = None
+    curTime = None
+    # optPath = []
 
-def droneTurnaroundDropRange(windSpd: float, windDeg: float, cruiseBat: float, payload: float, lod:int=30) -> dict:
+    # Find an initial feasible solution =======================================
+    # Grid searching
+    gridSize = 128 # Initially define grid size as 128 x 128, so that each time when dividing 2, coordinate will be integer
+    # (0, 0) = [max, max] -> (128, 128) = [min, min]
+    # Save the coordinates that has searched
+    searchedGrid = []
+    foundFeasibleFlag = False
+    while (not foundFeasibleFlag and gridSize >= 1):
+        # Search in grids
+        for i, j in product(range(int(128 / gridSize) + 1), range(int(128 / gridSize) + 1)):
+            gridCoord = (i * gridSize, j * gridSize)
+            if (gridCoord not in searchedGrid):
+                curGndSpdToCus = DRONE_MAX_GND_SPEED - i * gridSize / 128.0 * (DRONE_MAX_GND_SPEED - DRONE_MIN_GND_SPEED)
+                curGndSpdFromCus = DRONE_MAX_GND_SPEED - j * gridSize / 128.0 * (DRONE_MAX_GND_SPEED - DRONE_MIN_GND_SPEED)
+                curTime = profileTurnAround(
+                    startLoc = startLoc,
+                    cusLoc = cusLoc,
+                    endLoc = endLoc,
+                    hoverTime = hoverTime,
+                    landFlag = landFlag,  
+                    payload = payload,
+                    batCap = batCap,
+                    gndSpdToCus = curGndSpdToCus,
+                    gndSpdFromCus = curGndSpdFromCus,
+                    wind = wind,
+                    launchTime = launchTime)
+                if (curTime != None):
+                    foundFeasibleFlag = True
+                    break
+                else:                    
+                    searchedGrid.append(gridCoord)
+        # If not found, use smaller grid
+        gridSize = int(gridSize / 2)
 
-    """Given consistent wind speed and wind direction, with given parcel weight, returns the drone range that\
-        1) Drone can fly at maximum speed\
-        2) Drone can make delivery
-    
-    windSpd:    "Consistent wind speed"
-    windDeg:    "Consistent wind direction"
-    cruiseBat:  "Drone energy for cruising"
-    payload:    "Payload that needs to be delivered"
-    lod: int, optional, default 30
+    if (not foundFeasibleFlag):
+        return {
+            'gndSpdToCus': None,
+            'gndSpdFromCus': None,
+            'timeToCus': None,
+            'timeFromCus': None,
+            'totalTime': None
+        }
 
-    """
+    # Greedy search after finding feasible solution ===========================
+    # NOTE: Of course this can be written in a compact way, this is just for simplicity
+    stepLength = 0.01
+    stopCriteria = False
+    while (not stopCriteria):
+        d = {}
+        # Direction 2
+        if (curGndSpdToCus + stepLength <= DRONE_MAX_GND_SPEED
+            and curGndSpdFromCus - stepLength <= DRONE_MAX_GND_SPEED):
+            cTime = profileTurnAround(
+                startLoc = startLoc,
+                cusLoc = cusLoc,
+                endLoc = endLoc,
+                hoverTime = hoverTime,
+                landFlag = landFlag,
+                payload = payload,
+                batCap = batCap,
+                gndSpdToCus = curGndSpdToCus + stepLength,
+                gndSpdFromCus = curGndSpdFromCus - stepLength,
+                wind = wind,
+                launchTime = launchTime)
+            if (cTime != None and cTime < curTime):
+                d[2] = cTime
+        # Direction 3
+        if (curGndSpdToCus + stepLength <= DRONE_MAX_GND_SPEED):
+            cTime = profileTurnAround(
+                startLoc = startLoc,
+                cusLoc = cusLoc,
+                endLoc = endLoc,
+                hoverTime = hoverTime,
+                landFlag = landFlag,
+                payload = payload,
+                batCap = batCap,
+                gndSpdToCus = curGndSpdToCus + stepLength,
+                gndSpdFromCus = curGndSpdFromCus,
+                wind = wind,
+                launchTime = launchTime)
+            if (cTime != None and cTime < curTime):
+                d[3] = cTime
+        # Direction 4
+        if (curGndSpdToCus + stepLength <= DRONE_MAX_GND_SPEED
+            and curGndSpdFromCus + stepLength <= DRONE_MAX_GND_SPEED):
+            cTime = profileTurnAround(
+                startLoc = startLoc,
+                cusLoc = cusLoc,
+                endLoc = endLoc,
+                hoverTime = hoverTime,
+                landFlag = landFlag,
+                payload = payload,
+                batCap = batCap,
+                gndSpdToCus = curGndSpdToCus + stepLength,
+                gndSpdFromCus = curGndSpdFromCus + stepLength,
+                wind = wind,
+                launchTime = launchTime)
+            if (cTime != None and cTime < curTime):
+                d[4] = cTime
+        # Direction 5
+        if (curGndSpdFromCus + stepLength <= DRONE_MAX_GND_SPEED):
+            cTime = profileTurnAround(
+                startLoc = startLoc,
+                cusLoc = cusLoc,
+                endLoc = endLoc,
+                hoverTime = hoverTime,
+                landFlag = landFlag,
+                payload = payload,
+                batCap = batCap,
+                gndSpdToCus = curGndSpdToCus,
+                gndSpdFromCus = curGndSpdFromCus + stepLength,
+                wind = wind,
+                launchTime = launchTime)
+            if (cTime != None and cTime < curTime):
+                d[5] = cTime
+        # Direction 6
+        if (curGndSpdToCus - stepLength <= DRONE_MAX_GND_SPEED
+            and curGndSpdFromCus + stepLength <= DRONE_MAX_GND_SPEED):
+            cTime = profileTurnAround(
+                startLoc = startLoc,
+                cusLoc = cusLoc,
+                endLoc = endLoc,
+                hoverTime = hoverTime,
+                landFlag = landFlag,
+                payload = payload,
+                batCap = batCap,
+                gndSpdToCus = curGndSpdToCus - stepLength,
+                gndSpdFromCus = curGndSpdFromCus + stepLength,
+                wind = wind,
+                launchTime = launchTime)
+            if (cTime != None and cTime < curTime):
+                d[6] = cTime
+        if (len(d) > 0):
+            idx = min(d, key=d.get)
+            if (idx == 2):
+                curGndSpdToCus = curGndSpdToCus + stepLength
+                curGndSpdFromCus = curGndSpdFromCus - stepLength
+                curTime = d[2]
+            elif (idx == 3):
+                curGndSpdToCus = curGndSpdToCus + stepLength
+                curGndSpdFromCus = curGndSpdFromCus
+                curTime = d[3]
+            elif (idx == 4):
+                curGndSpdToCus = curGndSpdToCus + stepLength
+                curGndSpdFromCus = curGndSpdFromCus + stepLength
+                curTime = d[4]
+            elif (idx == 5):
+                curGndSpdToCus = curGndSpdToCus
+                curGndSpdFromCus = curGndSpdFromCus + stepLength
+                curTime = d[5]
+            elif (idx == 6):
+                curGndSpdToCus = curGndSpdToCus - stepLength
+                curGndSpdFromCus = curGndSpdFromCus + stepLength
+                curTime = d[6]
+        else:
+            stopCriteria = True
+    return {
+        'gndSpdToCus': curGndSpdToCus,
+        'gndSpdFromCus': curGndSpdFromCus,
+        'timeToCus': (
+            gndDistToCustomer / curGndSpdToCus 
+            + DRONE_CRUISE_ALTITUDE / DRONE_TAKEOFF_SPEED 
+            + DRONE_CRUISE_ALTITUDE / DRONE_LANDING_SPEED),
+        'timeAtCus': hoverTime,
+        'timeFromCus': (
+            gndDistToEndLoc / curGndSpdFromCus
+            + DRONE_CRUISE_ALTITUDE / DRONE_TAKEOFF_SPEED 
+            + DRONE_CRUISE_ALTITUDE / DRONE_LANDING_SPEED),
+        'totalTime': (
+            gndDistToCustomer / curGndSpdToCus 
+            + gndDistToEndLoc / curGndSpdFromCus 
+            + 2 * DRONE_CRUISE_ALTITUDE / DRONE_TAKEOFF_SPEED 
+            + hoverTime 
+            + 2 * DRONE_CRUISE_ALTITUDE / DRONE_LANDING_SPEED)
+    }
+
+
+def profileTurnaround(
+    startLoc: pt = None,
+    cusLoc: pt = None,
+    endLoc: pt = None,
+    hoverTime: float = 0,
+    serviceTime: float = 0,
+    landFlag: bool = DRONE_LANDING_FLAG,
+    payload: float = 0,
+    batCap: float = DRONE_BATTARY_CAPACITY, 
+    gndSpdToCus: float = None,
+    gndSpdFromCus: float = None,
+    windSpd: float = None,
+    windDeg: float = None
+    ):
+
+    # Ground speed degree =====================================================
+    gndDegToCustomer = vrpSolver.headingLatLon(startLoc, cusLoc)
+    gndDegToEndLoc = vrpSolver.headingLatLon(cusLoc, endLoc)
+    gndDistToCustomer = vrpSolver.distLatLon(startLoc, cusLoc, distUnit='meter')
+    gndDistToEndLoc = vrpSolver.distLatLon(cusLoc, endLoc, distUnit='meter')
+
+    # Mission profile =========================================================
+    profile = {
+        'launchFromStartLoc' : {'startTime': None, 'endTime': None, 'batRemain': None},
+        'cruiseToCustomer'   : {'startTime': None, 'endTime': None, 'batRemain': None},
+        'hoverAtCustomer'    : {'startTime': None, 'endTime': None, 'batRemain': None},
+        'landAtCustomer'     : {'startTime': None, 'endTime': None, 'batRemain': None},
+        'waitingAtCustomer'  : {'startTime': None, 'endTime': None, 'batRemain': None},
+        'launchFromCustomer' : {'startTime': None, 'endTime': None, 'batRemain': None},
+        'cruiseToEndLoc'     : {'startTime': None, 'endTime': None, 'batRemain': None},
+        'landAtEndLoc'       : {'startTime': None, 'endTime': None, 'batRemain': None}
+    }
+
+    # Initialize status =======================================================
+    accTime = 0
+    batRemain = batCap
+
+    # Launch from depot =======================================================
+    # Takeoff
+    timeTakeoffFromStartLoc = DRONE_CRUISE_ALTITUDE / DRONE_TAKEOFF_SPEED
+    energyTakeoffFromStartLoc = timeTakeoffFromStartLoc * droneCsmpRate(
+        payload = payload,
+        vertSpd = DRONE_TAKEOFF_SPEED,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = 0,
+        gndDeg = 0)
+    accTime += timeTakeoffFromStartLoc
+    batRemain -= energyTakeoffFromStartLoc
+    if (batRemain <= 0):
+        return None
+    # Update profile
+    profile['launchFromStartLoc']['startTime'] = 0
+    profile['launchFromStartLoc']['endTime'] = accTime
+    profile['launchFromStartLoc']['batRemain'] = batRemain
+    profile['cruiseToCustomer']['startTime'] = accTime
+
+    # Cruise to customer ======================================================
+    timeStartLoc2CusLoc = gndDistToCustomer / gndSpdToCus
+    energyCruise2Customer = timeStartLoc2CusLoc * droneCsmpRate(
+        payload = payload, 
+        vertSpd = 0, 
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = gndSpdToCus,
+        gndDeg = gndDegToCustomer)
+    accTime += timeStartLoc2CusLoc
+    batRemain -= energyCruise2Customer
+    if (batRemain <= 0):
+        return None
+    # Update profile
+    profile['cruiseToCustomer']['endTime'] = accTime
+    profile['cruiseToCustomer']['batRemain'] = batRemain
+    profile['hoverAtCustomer']['startTime'] = accTime
+
+    # Hover at customer (If hover time > 0) ===================================
+    if (hoverTime > 0):
+        energyHovering = hoverTime * droneCsmpRate(
+            payload = payload,
+            vertSpd = 0,
+            windSpd = windSpd,
+            windDeg = windDeg,
+            gndSpd = 0,
+            gndDeg = 0)
+        accTime += hoverTime
+        batRemain -= energyHovering
+        if (batRemain <= 0):
+            return None
+    # Update profile
+    profile['hoverAtCustomer']['endTime'] = accTime
+    profile['hoverAtCustomer']['batRemain'] = batRemain
+    profile['landAtCustomer']['startTime'] = accTime
+
+    # Land at customer ========================================================
+    if (landFlag):
+        timeLandAtCustomer = DRONE_CRUISE_ALTITUDE / DRONE_LANDING_SPEED
+        energyLandAtCustomer = timeLandAtCustomer * droneCsmpRate(
+            payload = payload,
+            vertSpd = DRONE_LANDING_SPEED,
+            windSpd = windSpd,
+            windDeg = windDeg,
+            gndSpd = 0,
+            gndDeg = 0)
+        accTime += timeLandAtCustomer
+        batRemain -= energyLandAtCustomer
+        if (batRemain <= 0):
+            return None
+    # Update profile
+    profile['landAtCustomer']['endTime'] = accTime
+    profile['landAtCustomer']['batRemain'] = batRemain
+    profile['waitingAtCustomer']['startTime'] = accTime
+
+    # Wait at customer ========================================================
+    if (serviceTime > 0):
+        accTime += serviceTime
+    # Update profile
+    profile['waitingAtCustomer']['endTime'] = accTime
+    profile['waitingAtCustomer']['batRemain'] = batRemain
+    profile['launchFromCustomer']['startTime'] = accTime
+
+    # Launch from customer ====================================================
+    if (landFlag):
+        timeLaunchFromCustomer = DRONE_CRUISE_ALTITUDE / DRONE_TAKEOFF_SPEED
+        energyLaunchFromCustomer = timeLaunchFromCustomer * droneCsmpRate(
+            payload = 0,
+            vertSpd = DRONE_TAKEOFF_SPEED,
+            windSpd = windSpd,
+            windDeg = windDeg,
+            gndSpd = 0,
+            gndDeg = 0)
+        accTime += timeLaunchFromCustomer
+        batRemain -= energyLaunchFromCustomer
+        if (batRemain <= 0):
+            return None
+    # Update profile
+    profile['launchFromCustomer']['endTime'] = accTime
+    profile['launchFromCustomer']['batRemain'] = batRemain
+    profile['cruiseToEndLoc']['startTime'] = accTime
+
+    # Cruise to depot ======================================================
+    timeCustomer2EndLoc = gndDistToEndLoc / gndSpdToCus
+    energyCruise2EndLoc = timeCustomer2EndLoc * droneCsmpRate(
+        payload = payload, 
+        vertSpd = 0, 
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = gndSpdFromCus,
+        gndDeg = gndDegToEndLoc)
+    accTime += timeCustomer2EndLoc
+    batRemain -= energyCruise2EndLoc
+    if (batRemain <= 0):
+        return None
+
+    # Update profile
+    profile['cruiseToEndLoc']['endTime'] = accTime
+    profile['cruiseToEndLoc']['batRemain'] = batRemain
+    profile['landAtEndLoc']['startTime'] = accTime
+
+    # Land at depot ========================================================
+    # Land at depot
+    timeLandAtEndLoc = DRONE_CRUISE_ALTITUDE / DRONE_LANDING_SPEED
+    energyLandAtEndLoc = timeLandAtEndLoc * droneCsmpRate(
+        payload = 0,
+        vertSpd = DRONE_LANDING_SPEED,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = 0,
+        gndDeg = 0)
+    accTime += timeLandAtEndLoc
+    batRemain -= energyLandAtEndLoc
+    if (batRemain <= 0):
+        return None
+    # Update profile
+    profile['landAtEndLoc']['endTime'] = accTime
+    profile['landAtEndLoc']['batRemain'] = batRemain
+
+    return accTime
+
+def radarTransit():
+    return
+
+def radarTurnaround(
+    startLoc = pt,
+    windSpd: float = 0,
+    windDeg: float = 0,
+    batRemain: float = DRONE_BATTARY_CAPACITY,
+    hoverTime: float = 0,
+    landFlag: bool = DRONE_LANDING_FLAG,
+    maxGndSpd: float = DRONE_MAX_GND_SPEED,
+    payload: float = DRONE_PARCEL_WEIGHT,
+    lod: int = 30) -> dict:
 
     # Initialize ==============================================================
     # If drone is flying at its maximum ground speed
     maxSpeedRange = []
     # If drone is flying at its maximum endurance
-    maxDistRange = []
+    maxEndurRange = []
+    # Poly ====================================================================
+    for d in range(lod):
+        maxSpeedRange.append(rangeTurnaroundMaxSpd(
+            windSpd = windSpd,
+            windDeg = windDeg,
+            batRemain = batRemain,
+            hoverTime = hoverTime,
+            landFlag = landFlag,
+            maxGndSpd = maxGndSpd,
+            payload = payload,
+            gndDeg = d * (360 / lod))['gndDist'])
+        maxEndurRange.append(rangeTurnaroundEndurance(
+            windSpd = windSpd,
+            windDeg = windDeg,
+            batRemain = batRemain,
+            hoverTime = hoverTime,
+            landFlag = landFlag,
+            maxGndSpd = maxGndSpd,
+            payload = payload,
+            gndDeg = d * (360 / lod))['gndDist'])
 
-    # Get maxSpeedRange =======================================================
-    def calMaxSpeedRange(deg):
-        # Max speed consumption rate
-        loadedMaxSpeedConsumptionRate = droneConsumptionRate(
+    return {
+        'maxSpeedRange': maxSpeedRange,
+        'maxEndurRange': maxEndurRange
+    }  
+
+def rangeTurnaroundMaxSpd(
+    windSpd: float = 0,
+    windDeg: float = 0,
+    gndDeg: float = 0,
+    batRemain: float = DRONE_BATTARY_CAPACITY,
+    hoverTime: float = 0,
+    landFlag: bool = DRONE_LANDING_FLAG,
+    maxGndSpd: float = DRONE_MAX_GND_SPEED,
+    payload: float = DRONE_PARCEL_WEIGHT) -> dict:
+
+    # NOTE: 无人机始终以最大可能的速度飞行，可以到达的范围，以及对应的往返剖面
+
+    # Initialize ==============================================================
+    mustEnergy = _calEnergyExceptCruise(
+        windSpd = windSpd,
+        windDeg = windDeg,
+        hoverTime = hoverTime,
+        landFlag = landFlag,
+        payload = payload)
+    remainBattery = batRemain - mustEnergy
+    if (remainBattery <= 0):
+        return None
+
+    # Max speed consumption rate
+    loadedMaxSpeedConsumptionRate = droneCsmpRate(
+        payload = payload,
+        vertSpd = 0,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = maxGndSpd,
+        gndDeg = deg)
+    noLoadMaxSpeedConsumptionRate = droneCsmpRate(
+        payload = 0,
+        vertSpd = 0,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = maxGndSpd,
+        gndDeg = deg + 180)
+
+    # Assuming maximum ground speed, calculate the maximum endurance
+    maxOnewayTime = remainBattery / (loadedMaxSpeedConsumptionRate + noLoadMaxSpeedConsumptionRate)
+    r = maxOnewayTime * maxGndSpd
+
+    return {
+        'gndDist': r,
+        'toCusSpd': maxGndSpd,
+        'fromCusSpd': maxGndSpd
+    } 
+
+def rangeTurnaroundEndurance(
+    windSpd: float = 0,
+    windDeg: float = 0,
+    gndDeg: float = 0,
+    batRemain: float = DRONE_BATTARY_CAPACITY,
+    hoverTime: float = 0,
+    landFlag: bool = DRONE_LANDING_FLAG,
+    maxGndSpd: float = DRONE_MAX_GND_SPEED,
+    payload: float = DRONE_PARCEL_WEIGHT) -> dict:
+
+    # Initialize ==============================================================
+    mustEnergy = _calEnergyExceptCruise(
+        windSpd = windSpd,
+        windDeg = windDeg,
+        hoverTime = hoverTime,
+        landFlag = landFlag,
+        payload = payload)
+    remainBattery = batRemain - mustEnergy
+    if (remainBattery <= 0):
+        return None
+
+    # Get maxEndurRange ========================================================
+    # Search on the percentage of allocating energy on Go/back
+    pLB = 0
+    pUB = 1
+    p = 0.5
+    r = 0
+    goGndSpd = None
+    backGndSpd = None
+    while (pUB - pLB > 0.001):
+        go = rangeCruiseEndurance(
+            payload = payload,
+            cruiseEnergy = (1 - p) * cruiseEnergy,
+            windSpd = windSpd,
+            windDeg = windDeg,
+            gndDeg = gndDeg)
+        goMaxEndur = go['gndDist']
+        goGndSpd = go['gndSpd']
+
+        back = rangeCruiseEndurance(
+            payload = 0,
+            cruiseEnergy = p * cruiseEnergy,
+            windSpd = windSpd,
+            windDeg = windDeg,
+            gndDeg = gndDeg + 180)
+        backMaxEndur = back['gndDist']
+        backGndSpd = back['gndSpd']
+
+        if (goMaxEndur > backMaxEndur):
+            pLB = p               
+        else:
+            pUB = p
+        p = pLB + (pUB - pLB) / 2
+        r = min(goMaxEndur, backMaxEndur)
+
+    return {
+        'gndDist': r,
+        'toCusSpd': goGndSpd,
+        'fromCusSpd': backGndSpd
+    } 
+
+def maxCruiseSpdInDist(
+    windSpd: float = 0,
+    windDeg: float = 0,
+    gndDeg: float = 0,
+    gndDist: float = 0,
+    payload: float = 0,
+    cruiseEnergy: float = DRONE_BATTARY_CAPACITY) -> dict:
+
+    # NOTE: 给定距离方位，最快能飞快送达
+    # 先计算经济航速，这是确保一定能到达的航速，然后尽可能更快
+    endr = rangeCruiseEndurance(
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndDeg = gndDeg,
+        payload = payload,
+        cruiseEnergy = cruiseEnergy)
+    if (endr['gndDist'] < gndDist):
+        return None
+
+    # Left 永远得是feasible的
+    lower = endr['gndSpd']
+    upper = DRONE_MAX_GND_SPEED
+    lowerConsumption = droneCsmpRate(
+        payload = payload,
+        vertSpd = 0,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = lower,
+        gndDeg = gndDeg)
+    upperConsumption = droneCsmpRate(
+        payload = payload,
+        vertSpd = 0,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = upper,
+        gndDeg = gndDeg)
+    lowerEnergy = (gndDist / lower) * lowerConsumption
+    upperEnergy = (gndDist / upper) * upperConsumption
+
+    mid = None
+    while (upper - lower > 0.01):
+        mid = lower + (upper - lower) / 2
+        midConsumption = droneCsmpRate(
             payload = payload,
             vertSpd = 0,
             windSpd = windSpd,
             windDeg = windDeg,
-            gndSpd = DRONE_MAX_GND_SPEED,
-            gndDeg = deg)
-        noLoadMaxSpeedConsumptionRate = droneConsumptionRate(
-            payload = 0,
-            vertSpd = 0,
-            windSpd = windSpd,
-            windDeg = windDeg,
-            gndSpd = DRONE_MAX_GND_SPEED,
-            gndDeg = deg + 180)
+            gndSpd = mid,
+            gndDeg = gndDeg)
+        midEnergy = (gndDist / mid) * midConsumption
 
-        # Assuming maximum ground speed, calculate the maximum endurance
-        maxOneWayTime = cruiseBat / (loadedMaxSpeedConsumptionRate + noLoadMaxSpeedConsumptionRate)
-        r = maxOneWayTime * DRONE_MAX_GND_SPEED
-        return r
+        if (midEnergy > cruiseEnergy):
+            lower = mid
+        else:
+            upper = mid
 
-    # Get maxDistRange ========================================================
-    def calMaxDistRange(deg):
-        # Search on the percentage of allocating energy on Go/back
-        pLB = 0
-        pUB = 1
-        p = 0.5
-        r = 0
-        while (pUB - pLB > 0.001):
-            goMaxEndur = droneMaxEndurance(
-                payload = payload,
-                cruiseBat = (1 - p) * cruiseBat,
-                windSpd = windSpd,
-                windDeg = windDeg,
-                gndDeg = deg)['maxDist']
-            backMaxEndur = droneMaxEndurance(
-                payload = 0,
-                cruiseBat = p * cruiseBat,
-                windSpd = windSpd,
-                windDeg = windDeg,
-                gndDeg = deg + 180)['maxDist']
-            if (goMaxEndur > backMaxEndur):
-                pLB = p               
-            else:
-                pUB = p
-            p = pLB + (pUB - pLB) / 2
-            r = min(goMaxEndur, backMaxEndur)
-        return r
+    return {
+        'maxGndSpd': lower,
+        'minGndTime': (gndDist / lower)
+    }
 
+
+    # Calculate energy needed for taking off, hovering and landing ============
+    mustEnergy = _calEnergyExceptCruise(
+        windSpd = windSpd,
+        windDeg = windDeg,
+        hoverTime = hoverTime,
+        landFlag = landFlag,
+        payload = payload)
+    remainBattery = DRONE_BATTARY_CAPACITY - mustEnergy
+    if (remainBattery <= 0):
+        return None
+
+def radarCuriseXY(
+    startLoc: pt,
+    windSpd: float = 0,
+    windDeg: float = 0,
+    cruiseEnergy: float = DRONE_BATTARY_CAPACITY,
+    maxGndSpd: float = DRONE_MAX_GND_SPEED,
+    payload: float = DRONE_PARCEL_WEIGHT,
+    lod: int = 30) -> dict:
+
+    # Initialize ==============================================================
+    # If drone is flying at its maximum ground speed
+    maxSpeedRadar = []
+    # If drone is flying at its maximum endurance
+    maxEndurRadar = []
     # Poly ====================================================================
     for d in range(lod):
-        maxSpeedRange.append(calMaxSpeedRange(d * 360 / lod))
-        maxDistRange.append(calMaxDistRange(d * 360 / lod))
+        gndSpeedRadar = rangeCuriseMaxSpd(
+            windSpd = windSpd,
+            windDeg = windDeg,
+            cruiseEnergy = cruiseEnergy,
+            maxGndSpd = maxGndSpd,
+            payload = payload,
+            gndDeg = d * (360 / lod))['gndDist']
+        ptSpeedRadar = vrpSolver.ptInDistXY(
+            pt = startLoc,
+            direction = d * (360 / lod),
+            dist = gndSpeedRadar)
+        maxSpeedRadar.append(ptSpeedRadar)
+
+        gndEndurRadar = rangeCruiseEndurance(
+            windSpd = windSpd,
+            windDeg = windDeg,
+            cruiseEnergy = cruiseEnergy,
+            maxGndSpd = maxGndSpd,
+            payload = payload,
+            gndDeg = d * (360 / lod))['gndDist']
+        ptEndurRadar = vrpSolver.ptInDistXY(
+            pt = startLoc,
+            direction = d * (360 / lod),
+            dist = gndEndurRadar)
+        maxEndurRadar.append(ptEndurRadar)
 
     return {
-        'maxSpeedRange': maxSpeedRange,
-        'maxDistRange': maxDistRange
+        'maxSpeedRadar': maxSpeedRadar,
+        'maxEndurRadar': maxEndurRadar
     }
 
-def optDroneDropSpeed(
-    launchPt: pt,
-    waypoints: list[pt], 
-    payloadDrops: list[float],        
-    windSpd: float, 
-    windDeg: float, 
-    cruiseBat: float, 
-    returnPt: pt|None = None, 
-    hoveringBeforeDropping: float|int|list|None = None,
-    hoveringAfterDropping: float|int|list|None = None,
-    maxGndSpd: float = DRONE_MAX_GND_SPEED, 
-    droneEmptyWeight: float = DRONE_EMPTY_WEIGHT,
-    spdPrecise: float=0.1) -> dict:
+# [Done]
+def rangeCuriseMaxSpd(
+    payload: float = 0,
+    cruiseEnergy:  float = DRONE_BATTARY_CAPACITY,
+    windSpd: float = 0,
+    windDeg: float = 0,
+    maxGndSpd: float = DRONE_MAX_GND_SPEED,
+    gndDeg: float = 0) -> dict:
 
-    """Given wind and drone battary conditions, optimize the ground speed of legs between waypoints.
+    # NOTE: 给定方向，最快能飞多远
+    # Max speed consumption rate
+    maxSpeedConsumptionRate = droneCsmpRate(
+        payload = payload,
+        vertSpd = 0,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = maxGndSpd,
+        gndDeg = gndDeg)
 
-    Notes
-    -----
-    In this function, the energy consumption for launching and landing are not included/considered.
-
-
-    Parameters
-    ----------
-    waypoints: list[pt], required
-        A list of waypoints to be visited by drone, could be 
-
-    """
-
-    # Sanity check ============================================================
-    if (len(waypoints) != len(payloadDrops)):
-        raise UnsupportedInputError("ERROR: the length of `waypoints` should be the same as the length of `payloadDrops`")
-
-    if (type(hoveringBeforeDropping) == float or type(hoveringBeforeDropping) == int):
-        hoveringBeforeDropping = [hoveringBeforeDropping] * len(waypoints)
-    if (type(hoveringAfterDropping) == float or type(hoveringAfterDropping) == int):
-        hoveringAfterDropping = [hoveringAfterDropping] * len(waypoints)
-
-    if (returnPt == None):
-        returnPt = launchPt
-     
-    # Legs between waypoints
-    gndSpdList = []
-    gndDegList = []
-    gndDistList = []
-
-    # Function of calculating the energy consumption given ground speeds
-    def calEnergy(gndSpdList, gndDegList, gndDistList) -> float:
-        ergy = 0
-        # Energy for cruising
-        for i in range(len(waypoints)):
-            ergy += (gndDistList[i] / gndSpdList[i]) * droneConsumptionRate(
-                payload = sum([payloadDrops[k] for k in range(i, len(waypoints))]), 
-                windSpd = windSpd, windDeg = windDeg, vertSpd = 0, 
-                gndSpd = gndSpdList[i], gndDeg = gndDegList[i], droneEmptyWeight = droneEmptyWeight)
-        ergy += (gndDistList[-1] / gndSpdList[-1]) * droneConsumptionRate(
-            payload = 0, windSpd = windSpd, windDeg = windDeg, vertSpd = 0, 
-            gndSpd = gndSpdList[-1], gndDeg = gndDegList[-1], droneEmptyWeight = droneEmptyWeight)
-        # Energy for hovering - loaded with package
-        if (isinstance(hoveringBeforeDropping, list)):
-            for i in range(len(waypoints)):
-                ergy += hoveringBeforeDropping[i] * droneConsumptionRate(
-                    payload = sum([payloadDrops[k] for k in range(i, len(waypoints))]), 
-                    windSpd = windSpd, windDeg = windDeg, vertSpd = 0, 
-                    gndSpd = 0, gndDeg = 0, droneEmptyWeight = droneEmptyWeight)
-        # Energy for hovering - unloaded the package
-        if (isinstance(hoveringAfterDropping, list)):
-            for i in range(len(waypoints)):
-                ergy += hoveringAfterDropping[i] * droneConsumptionRate(
-                    payload = sum([payloadDrops[k] for k in range(i + 1, len(waypoints))]), 
-                    windSpd = windSpd, windDeg = windDeg, vertSpd = 0, 
-                    gndSpd = 0, gndDeg = 0, droneEmptyWeight = droneEmptyWeight)
-        return ergy
-
-    def calProfile(gndSpdList, gndDistList) -> dict:
-        totalPayload = sum(payloadDrops)
-        timeStamps = [0.0]
-        visitSeq = [launchPt]
-        payloadSeq = [totalPayload]        
-        if (hoveringBeforeDropping == None and hoveringAfterDropping == None):
-            for i in range(len(waypoints)):
-                timeStamps.append(timeStamps[-1] + gndDistList[i] / gndSpdList[i])
-                visitSeq.append(waypoints[i])
-                payloadSeq.append(sum([payloadDrops[k] for k in range(i + 1, len(waypoints))]))
-        elif (isinstance(hoveringBeforeDropping, list) and hoveringAfterDropping == None):
-            for i in range(len(waypoints)):
-                timeStamps.append(timeStamps[-1] + gndDistList[i] / gndSpdList[i])
-                visitSeq.append(waypoints[i])
-                payloadSeq.append(sum([payloadDrops[k] for k in range(i, len(waypoints))]))
-                timeStamps.append(timeStamps[-1] + hoveringBeforeDropping[i])
-                visitSeq.append(waypoints[i])
-                payloadSeq.append(sum([payloadDrops[k] for k in range(i + 1, len(waypoints))]))
-        elif (hoveringBeforeDropping == None and isinstance(hoveringAfterDropping, list)):
-            for i in range(len(waypoints)):
-                timeStamps.append(timeStamps[-1] + gndDistList[i] / gndSpdList[i])
-                visitSeq.append(waypoints[i])
-                payloadSeq.append(sum([payloadDrops[k] for k in range(i + 1, len(waypoints))]))
-                timeStamps.append(timeStamps[-1] + hoveringAfterDropping[i])
-                visitSeq.append(waypoints[i])
-                payloadSeq.append(sum([payloadDrops[k] for k in range(i + 1, len(waypoints))]))
-        elif (isinstance(hoveringBeforeDropping, list) and isinstance(hoveringAfterDropping, list)):
-            for i in range(len(waypoints)):
-                timeStamps.append(timeStamps[-1] + gndDistList[i] / gndSpdList[i])
-                visitSeq.append(waypoints[i])
-                payloadSeq.append(sum([payloadDrops[k] for k in range(i, len(waypoints))]))
-                timeStamps.append(timeStamps[-1] + hoveringBeforeDropping[i])
-                visitSeq.append(waypoints[i])
-                payloadSeq.append(sum([payloadDrops[k] for k in range(i, len(waypoints))]))
-                timeStamps.append(timeStamps[-1] + hoveringAfterDropping[i])
-                visitSeq.append(waypoints[i])
-                payloadSeq.append(sum([payloadDrops[k] for k in range(i + 1, len(waypoints))]))
-        timeStamps.append(timeStamps[-1] + gndDistList[-1] / gndSpdList[-1])
-        visitSeq.append(returnPt)
-        payloadSeq.append(0)
-        return {
-            'timeStamps': timeStamps,
-            'visitSeq': visitSeq,
-            'payloadSeq': payloadSeq,
-            'profileTime': timeStamps[-1]
-        }
-
-    # Step 1: Initialize, assume that the drone is flying at its maximum speed, regardless of energy limit
-    gndSpdList.append(maxGndSpd)
-    gndDegList.append(vrpSolver.headingXY(launchPt, waypoints[0]))
-    gndDistList.append(vrpSolver.distEuclidean2D(launchPt, waypoints[0]))
-    for i in range(len(waypoints) - 1):
-        gndSpdList.append(maxGndSpd)
-        gndDegList.append(vrpSolver.headingXY(waypoints[i], waypoints[i + 1]))
-        gndDistList.append(vrpSolver.distEuclidean2D(waypoints[i], waypoints[i + 1]))
-    gndSpdList.append(maxGndSpd)
-    gndDegList.append(vrpSolver.headingXY(waypoints[-1], returnPt))
-    gndDistList.append(vrpSolver.distEuclidean2D(waypoints[-1], returnPt))
-
-    # Now, ergy is the energy needed to complete the flight in maximum ground speed
-    ergy = calEnergy(gndSpdList, gndDegList, gndDistList)
-    profile = calProfile(gndSpdList, gndDistList)
-    # If the energy to fly at maximum speed is already sufficient, returns max speed
-    if (ergy <= cruiseBat):
-        return {
-            'feasible': True,
-            'gndSpdList': gndSpdList,
-            'remainBat': cruiseBat - ergy,
-            'timeStamps': profile['timeStamps'],
-            'visitSeq': profile['visitSeq'],
-            'payloadSeq': profile['payloadSeq'],
-            'profileTime': profile['profileTime']
-        }
-
-    # Step 2: Reduce energy consumption, this step is done by reducing ground speeds
-    # NOTE: Purpose of this step is to find a feasible solution
-    while (True):
-        bestReducedLegIndex = len(gndSpdList)
-        for i in range(len(gndSpdList)):
-            if (gndSpdList[i] > spdPrecise):
-                updateGndSpd = [spd for spd in gndSpdList]
-                updateGndSpd[i] -= spdPrecise
-                updatedEnergy = calEnergy(updateGndSpd, gndDegList, gndDistList)
-                if (updatedEnergy < ergy):
-                    ergy = updatedEnergy
-                    bestReducedLegIndex = i
-        if (bestReducedLegIndex == len(gndSpdList)):
-            break
-        else:
-            gndSpdList[bestReducedLegIndex] -= spdPrecise
-            gndSpdList[bestReducedLegIndex] = round(gndSpdList[bestReducedLegIndex], 2)
-
-    # If after reducing energy consumption, it is still greater than given limit, then its infeasible
-    if (ergy > cruiseBat):
-        return {
-            'feasible': False,
-            'gndSpdList': [],
-            'remainBat': 0,
-            'timeStamps': [],
-            'visitSeq': [],
-            'payloadSeq': [],
-            'profileTime': 0
-        }
-
-    # Step 3: When we find a solution which the energy consumption is within cruiseBat, improve gndSpds
-    # NOTE: Improving direction is the best \Delta Energy / \Delta Time
-
-    profileTime = calProfile(gndSpdList, gndDistList)['profileTime']
-    while (True):
-        marginImprove = []
-        for i in range(len(gndSpdList)):
-            if(gndSpdList[i] + spdPrecise <= maxGndSpd):
-                updateGndSpd = [spd for spd in gndSpdList]
-                updateGndSpd[i] += spdPrecise
-                updatedEnergy = calEnergy(updateGndSpd, gndDegList, gndDistList)
-                if (updatedEnergy < cruiseBat):
-                    updatedProfileTime = calProfile(updateGndSpd, gndDistList)['profileTime']
-                    marginImprove.append(((profileTime - updatedProfileTime) / (updatedEnergy - ergy), i, updatedProfileTime, updatedEnergy))
-        if (len(marginImprove) == 0):
-            break
-        else:
-            m = max(marginImprove)
-            profileTime = m[2]
-            gndSpdList[m[1]] += spdPrecise
-            gndSpdList[m[1]] = round(gndSpdList[m[1]], 2)
-            ergy = m[3]
-
-    profile = calProfile(gndSpdList, gndDistList)
+    # Assuming maximum ground speed, calculate the maximum endurance
+    maxDist = (cruiseEnergy / maxSpeedConsumptionRate) * maxGndSpd
     return {
-        'feasible': True,
-        'gndSpdList': gndSpdList,
-        'remainBat': cruiseBat - ergy,
-        'timeStamps': profile['timeStamps'],
-        'visitSeq': profile['visitSeq'],
-        'payloadSeq': profile['payloadSeq'],
-        'profileTime': profile['profileTime']
+        'gndSpd': maxGndSpd,
+        'gndDist': maxDist
     }
 
-def droneMaxEndurance(payload:float, cruiseBat: float, windSpd: float, windDeg: float, gndDeg: float) -> dict:
-    
-    """Given parameters, return the most energy saving speed and max endurance
-    
-    payload:    "Weight in [kg]" = None,
-    cruiseBat:  "Remaining battery" = 500000,
-    windSpd:    "Wind speed" = 0,
-    windDeg:    "Direction of wind speed, in [degree]" = 0,
-    gndDeg:     "Direction of ground speed, in [degree]" = 0    
-    """
+# [Done]
+def rangeCruiseEndurance(
+    payload: float = 0,
+    cruiseEnergy:  float = DRONE_BATTARY_CAPACITY,
+    windSpd: float = 0,
+    windDeg: float = 0,
+    maxGndSpd: float = DRONE_MAX_GND_SPEED,
+    gndDeg: float = 0) -> dict:
+
+    # NOTE: 给定方向，最远能飞多远
 
     # bounding of speed =======================================================
-    left = 0
-    right = DRONE_MAX_GND_SPEED
-    while (right - left > 0.01):
-        m1 = left + (right - left) / 3
-        m2 = right - (right - left) / 3
-        m1Consumption = droneConsumptionRate(
+    lower = DRONE_MIN_GND_SPEED
+    upper = DRONE_MAX_GND_SPEED
+    while (upper - lower > 0.01):
+        m1 = lower + (upper - lower) / 3
+        m2 = upper - (upper - lower) / 3
+        m1Consumption = droneCsmpRate(
             payload = payload,
             vertSpd = 0,
             windSpd = windSpd,
             windDeg = windDeg,
             gndSpd = m1,
             gndDeg = gndDeg)
-        m2Consumption = droneConsumptionRate(
+        m2Consumption = droneCsmpRate(
             payload = payload,
             vertSpd = 0,
             windSpd = windSpd,
             windDeg = windDeg,
             gndSpd = m2,
             gndDeg = gndDeg)
-        m1Endur = (cruiseBat / m1Consumption) * m1
-        m2Endur = (cruiseBat / m2Consumption) * m2
+        m1Endur = (cruiseEnergy / m1Consumption) * m1
+        m2Endur = (cruiseEnergy / m2Consumption) * m2
         if (m1Endur >= m2Endur):
-            right = m2
+            upper = m2
         else:
-            left = m1        
-    savGndSpd = left + (right - left) / 2
-    savConsumption = droneConsumptionRate(
-        payload = payload,
-        vertSpd = 0,
-        windSpd = windSpd,
-        windDeg = windDeg,
-        gndSpd = savGndSpd,
-        gndDeg = gndDeg)
-    savEndur = (cruiseBat / savConsumption) * savGndSpd
+            lower = m1        
+    savEndur = (cruiseEnergy / lower) * lower
 
     return {
-        'savGndSpd': savGndSpd,
-        'maxDist': savEndur
+        'gndSpd': lower,
+        'gndDist': savEndur
     }
 
-def queryWindSpd(wind:dict|IntervalTree, now:float, cycleFlag:bool=True) -> dict|None:
-    
-    """Given a time stamp, find current wind speed, wind direction, time left in current wind window"
-
-    wind:       "List of dictionary, wind speed/wind direct in time sequence, time starts from 0\
-                [{\
-                    'startTime': startTime,\
-                    'endTime': endTime,\
-                    'windSpd': windSpd, # [m/s]\
-                    'windDeg': winDeg\
-                }, ...]" = None,
-    now:        "Current time" = None,
-    cycleFlag:  "True if repeat the wind data in cycle" = True
-
-    """
-
-    # A polynomial variation in wind speed with height, widely used in wind turbine engineering
-    # v_w(h) = v_{10} (\frac{h}{h_{10}})^\alpha
-    # - v_w(h): wind speed at AGL h
-    # - v_{10}: wind at AGL 10 m
-    # - h: height in AGL [m]
-    # - h_{10}: 10 m (Ground level)
-    # - \alpha: Hellmann exponent
-
-    # Initialize ==============================================================
-    curWindSpd = None
-    curWindDeg = None
-    timeLeft = None
-
-    if (isinstance(wind, dict)):
-        lengWindData = 0
-        for w in wind:
-            if (w['endTime'] > lengWindData):
-                lengWindData = w['endTime']
-        if (cycleFlag):
-            while (now >= lengWindData):
-                now -= lengWindData
-        else:
-            if (now > lengWindData):
-                return None
-
-        for s in range(len(wind)):
-            if (now >= wind[s]['startTime'] and now < wind[s]['endTime']):
-                curWindSpd = wind[s]['windSpd']
-                # NOTICE: The direction of the wind is the same as the wind vector, not meteorology term
-                curWindDeg = wind[s]['windDeg']
-                timeLeft = wind[s]['endTime'] - now
-                if (curWindSpd != None and curWindDeg != None and timeLeft != None):
-                    return {
-                        'curWindSpd': curWindSpd,
-                        'curWindDeg': curWindDeg,
-                        'timeLeft': timeLeft
-                    }
-    return None
-
-def droneConsumptionRate(payload:float, windSpd:float, windDeg:float, vertSpd:float, gndSpd:float, gndDeg:float, droneEmptyWeight:float=DRONE_EMPTY_WEIGHT)->float:
-
-    """Drone energy consumption rate in [J/s]
-
-    payload:    "Weight in [kg]" = None,
-    windSpd:    "Wind speed" = 0,
-    windDeg:    "Direction of wind speed, in [degree]" = 0,
-    vertSpd:    "Vertical speed" = 0,
-    gndSpd:     "Ground speed of drone" = 0,
-    gndDeg:     "Direction of gnd speed, in [degree]" = 0    
-    """
+# [Done]
+def droneCsmpRate(
+    payload: float = 0,
+    windSpd: float = 0,
+    windDeg: float = 0,
+    vertSpd: float = 0,
+    gndSpd: float = 0,
+    gndDeg: float = 0) -> float:
 
     # Reference ===============================================================
     # Z. Liu et al. A Power Consumption Model for Multi-rotor Small Unmanned Aircraft Systems
@@ -513,17 +816,13 @@ def droneConsumptionRate(payload:float, windSpd:float, windDeg:float, vertSpd:fl
 
     # Calculate air speed =====================================================
     # V_air + V_wind = V_gnd (as vectors)
-    gndX, gndY = vrpSolver.vecPolar2XY([gndSpd, gndDeg])
-    windX, windY = vrpSolver.vecPolar2XY([windSpd, windDeg])
-    airX = gndX - windX
-    airY = gndY - windY
-    airSpd, _ = vrpSolver.vecXY2Polar([airX, airY])
+    airSpd, airDeg = vrpSolver.polarSubtract([gndSpd, gndDeg], [windSpd, windDeg])
 
     # Induced power, profile power, parasite power ============================
     # Power = induced power + profile power + parasite power
     # Thrust
     T = math.sqrt(
-        ((droneEmptyWeight + payload) * g - c5 * (airSpd * math.cos(math.radians(alpha)))**2)**2 
+        ((DRONE_EMPTY_WEIGHT + payload) * g - c5 * (airSpd * math.cos(math.radians(alpha)))**2)**2 
         + (c4 * airSpd * airSpd)**2)
     # Induced power, c6 term has been neglected since c6 = 0
     powerInduced = k1 * T * (vertSpd / 2 + math.sqrt((vertSpd / 2)**2 + T / (k2**2)))
@@ -535,3 +834,59 @@ def droneConsumptionRate(payload:float, windSpd:float, windDeg:float, vertSpd:fl
     power = powerInduced + powerProfile + powerParasite
 
     return power
+
+# [Done]
+def _calEnergyExceptCruise(
+    windSpd: float = 0,
+    windDeg: float = 0,
+    hoverTime: float = 0,
+    landFlag: float = 0,
+    payload: float = 0):
+
+    # NOTE: 去掉起飞，降落等的毛重
+
+    # Calculate energy needed for taking off, hovering and landing ============
+    mustEnergy = 0
+    # First takeoff
+    mustEnergy += (DRONE_CRUISE_ALTITUDE / DRONE_TAKEOFF_SPEED) * droneCsmpRate(
+        payload = payload,
+        vertSpd = DRONE_TAKEOFF_SPEED,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = 0,
+        gndDeg = 0)
+    # Hover
+    if (hoverTime != None and hoverTime > 0):
+        mustEnergy += hoverTime * droneCsmpRate(
+            payload = payload,
+            vertSpd = 0,
+            windSpd = windSpd,
+            windDeg = windDeg,
+            gndSpd = 0,
+            gndDeg = 0)
+    # Land/launch at customer
+    if (landFlag):
+        mustEnergy += (DRONE_CRUISE_ALTITUDE / DRONE_LANDING_SPEED) * droneCsmpRate(
+            payload = payload,
+            vertSpd = DRONE_LANDING_SPEED,
+            windSpd = windSpd,
+            windDeg = windDeg,
+            gndSpd = 0,
+            gndDeg = 0)
+        mustEnergy += (DRONE_CRUISE_ALTITUDE / DRONE_TAKEOFF_SPEED) * droneCsmpRate(
+            payload = 0,
+            vertSpd = DRONE_TAKEOFF_SPEED,
+            windSpd = windSpd,
+            windDeg = windDeg,
+            gndSpd = 0,
+            gndDeg = 0)
+    # Land at customer
+    mustEnergy += (DRONE_CRUISE_ALTITUDE / DRONE_LANDING_SPEED) * droneCsmpRate(
+        payload = 0,
+        vertSpd = DRONE_LANDING_SPEED,
+        windSpd = windSpd,
+        windDeg = windDeg,
+        gndSpd = 0,
+        gndDeg = 0)
+
+    return mustEnergy
